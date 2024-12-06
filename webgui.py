@@ -42,7 +42,7 @@ default_values = {
     "fps": 24,
     "device": "cuda"
 }
-
+#加载配置和ffmpeg
 ffmpeg_path = os.getenv('FFMPEG_PATH')
 if ffmpeg_path is None:
     print("please download ffmpeg-static and export to FFMPEG_PATH. \nFor example: export FFMPEG_PATH=/musetalk/ffmpeg-4.4-amd64-static")
@@ -57,19 +57,21 @@ if config.weight_dtype == "fp16":
     weight_dtype = torch.float16
 else:
     weight_dtype = torch.float32
-
+#用cuda还是cpu
 device = "cuda"
 if not torch.cuda.is_available():
     device = "cpu"
-
+#加载推理config
 inference_config_path = config.inference_config
 infer_config = OmegaConf.load(inference_config_path)
-
+#开始加载模型了
 ############# model_init started #############
 ## vae init
+#加载预训练的自动编码器模型
 vae = AutoencoderKL.from_pretrained(config.pretrained_vae_path).to("cuda", dtype=weight_dtype)
 
 ## reference net init
+#加载unet模型
 reference_unet = UNet2DConditionModel.from_pretrained(
     config.pretrained_base_model_path,
     subfolder="unet",
@@ -77,6 +79,7 @@ reference_unet = UNet2DConditionModel.from_pretrained(
 reference_unet.load_state_dict(torch.load(config.reference_unet_path, map_location="cpu"))
 
 ## denoising net init
+#是否加载运动模型
 if os.path.exists(config.motion_module_path):
     ### stage1 + stage2
     denoising_unet = EchoUNet3DConditionModel.from_pretrained_2d(
@@ -101,20 +104,23 @@ else:
 denoising_unet.load_state_dict(torch.load(config.denoising_unet_path, map_location="cpu"), strict=False)
 
 ## face locator init
+#面部定位模型
 face_locator = FaceLocator(320, conditioning_channels=1, block_out_channels=(16, 32, 96, 256)).to(dtype=weight_dtype, device="cuda")
 face_locator.load_state_dict(torch.load(config.face_locator_path))
 
 ## load audio processor params
+#加载音频模型
 audio_processor = load_audio_model(model_path=config.audio_model_path, device=device)
 
 ## load face detector params
+#加载人脸检测器
 face_detector = MTCNN(image_size=320, margin=0, min_face_size=20, thresholds=[0.6, 0.7, 0.7], factor=0.709, post_process=True, device=device)
 
 ############# model_init finished #############
-
+#加载噪声调度器参数配置，噪声控制
 sched_kwargs = OmegaConf.to_container(infer_config.noise_scheduler_kwargs)
 scheduler = DDIMScheduler(**sched_kwargs)
-
+#加载一个音频转视频的管道，然后放到cuda设备里
 pipe = Audio2VideoPipeline(
     vae=vae,
     reference_unet=reference_unet,
@@ -139,20 +145,23 @@ def select_face(det_bboxes, probs):
     return sorted_bboxes[0]
 
 def process_video(uploaded_img, uploaded_audio, width, height, length, seed, facemask_dilation_ratio, facecrop_dilation_ratio, context_frames, context_overlap, cfg, steps, sample_rate, fps, device):
-
+    #随机数种子
     if seed is not None and seed > -1:
         generator = torch.manual_seed(seed)
     else:
         generator = torch.manual_seed(random.randint(100, 1000000))
-
+    #创建一个面部区域遮罩
     #### face musk prepare
     face_img = cv2.imread(uploaded_img)
     face_mask = np.zeros((face_img.shape[0], face_img.shape[1])).astype('uint8')
-    det_bboxes, probs = face_detector.detect(face_img)
-    select_bbox = select_face(det_bboxes, probs)
+    #人脸检测器检测人脸
+    det_bboxes, probs = face_detector.detect(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB))
+    select_bbox = select_face(det_bboxes, probs) 
+    #如果没检测到就全部设置为白色
     if select_bbox is None:
         face_mask[:, :] = 255
     else:
+    #图像的裁剪和填充
         xyxy = select_bbox[:4]
         xyxy = np.round(xyxy).astype('int')
         rb, re, cb, ce = xyxy[1], xyxy[3], xyxy[0], xyxy[2]
@@ -164,14 +173,14 @@ def process_video(uploaded_img, uploaded_audio, width, height, length, seed, fac
         r_pad_crop = int((re - rb) * facecrop_dilation_ratio)
         c_pad_crop = int((ce - cb) * facecrop_dilation_ratio)
         crop_rect = [max(0, cb - c_pad_crop), max(0, rb - r_pad_crop), min(ce + c_pad_crop, face_img.shape[1]), min(re + r_pad_crop, face_img.shape[0])]
-        face_img = crop_and_pad(face_img, crop_rect)
-        face_mask = crop_and_pad(face_mask, crop_rect)
+        face_img = crop_and_pad(face_img, crop_rect)[0]
+        face_mask= crop_and_pad(face_mask, crop_rect)[0]
         face_img = cv2.resize(face_img, (width, height))
         face_mask = cv2.resize(face_mask, (width, height))
-
+    #格式转换，准备掩码张亮
     ref_image_pil = Image.fromarray(face_img[:, :, [2, 1, 0]])
     face_mask_tensor = torch.Tensor(face_mask).to(dtype=weight_dtype, device="cuda").unsqueeze(0).unsqueeze(0).unsqueeze(0) / 255.0
-    
+    #跑个管道生成视频
     video = pipe(
         ref_image_pil,
         uploaded_audio,
@@ -187,7 +196,7 @@ def process_video(uploaded_img, uploaded_audio, width, height, length, seed, fac
         fps=fps,
         context_overlap=context_overlap
     ).videos
-
+    #保存
     save_dir = Path("output/tmp")
     save_dir.mkdir(exist_ok=True, parents=True)
     output_video_path = save_dir / "output_video.mp4"
@@ -195,11 +204,19 @@ def process_video(uploaded_img, uploaded_audio, width, height, length, seed, fac
 
     video_clip = VideoFileClip(str(output_video_path))
     audio_clip = AudioFileClip(uploaded_audio)
-    final_output_path = save_dir / "output_video_with_audio.mp4"
+
+    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+    final_output_filename = f"output_video_with_audio_{timestamp}.mp4"
+    final_output_path = save_dir / final_output_filename
+    
+    # final_output_path = save_dir / "output_video_with_audio.mp4"
+    
     video_clip = video_clip.set_audio(audio_clip)
     video_clip.write_videofile(str(final_output_path), codec="libx264", audio_codec="aac")
 
-    return final_output_path
+
+    
+    return final_output_filename
   
 with gr.Blocks() as demo:
     gr.Markdown('# EchoMimic')
